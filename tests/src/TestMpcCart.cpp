@@ -60,12 +60,13 @@ public:
 
   virtual double runningCost(double t, const StateDimVector & x, const InputDimVector & u) const override
   {
-    return 0.5 * weight_param_.running_state.dot(x.cwiseAbs2()) + 0.5 * weight_param_.running_input.dot(u.cwiseAbs2());
+    return 0.5 * weight_param_.running_state.dot((x - ref_x_).cwiseAbs2())
+           + 0.5 * weight_param_.running_input.dot((u - ref_u_).cwiseAbs2());
   }
 
   virtual double terminalCost(double t, const StateDimVector & x) const override
   {
-    return 0.5 * weight_param_.terminal_state.dot(x.cwiseAbs2());
+    return 0.5 * weight_param_.terminal_state.dot((x - ref_x_).cwiseAbs2());
   }
 
   virtual void calcStateEqDeriv(double t,
@@ -100,8 +101,8 @@ public:
                                     Eigen::Ref<StateDimVector> running_cost_deriv_x,
                                     Eigen::Ref<InputDimVector> running_cost_deriv_u) const override
   {
-    running_cost_deriv_x = weight_param_.running_state.cwiseProduct(x);
-    running_cost_deriv_u = weight_param_.running_input.cwiseProduct(u);
+    running_cost_deriv_x = weight_param_.running_state.cwiseProduct(x - ref_x_);
+    running_cost_deriv_u = weight_param_.running_input.cwiseProduct(u - ref_u_);
   }
 
   virtual void calcRunningCostDeriv(double t,
@@ -126,7 +127,7 @@ public:
                                      const StateDimVector & x,
                                      Eigen::Ref<StateDimVector> terminal_cost_deriv_x) const override
   {
-    terminal_cost_deriv_x = weight_param_.terminal_state.cwiseProduct(x);
+    terminal_cost_deriv_x = weight_param_.terminal_state.cwiseProduct(x - ref_x_);
   }
 
   virtual void calcTerminalCostDeriv(double t,
@@ -150,6 +151,12 @@ public:
     next_state_standard_scaler_ = next_state_standard_scaler;
   }
 
+  void setRef(const StateDimVector & ref_x, const InputDimVector & ref_u)
+  {
+    ref_x_ = ref_x;
+    ref_u_ = ref_u;
+  }
+
 protected:
   std::shared_ptr<DDMPC::StateEq> state_eq_;
 
@@ -158,6 +165,9 @@ protected:
   std::shared_ptr<DDMPC::StandardScaler<double, 4>> state_standard_scaler_;
   std::shared_ptr<DDMPC::StandardScaler<double, 2>> input_standard_scaler_;
   std::shared_ptr<DDMPC::StandardScaler<double, 4>> next_state_standard_scaler_;
+
+  StateDimVector ref_x_ = StateDimVector::Zero();
+  InputDimVector ref_u_ = InputDimVector::Zero();
 };
 
 namespace Eigen
@@ -169,12 +179,9 @@ TEST(TestMpcCart, Test1)
 {
   ros::NodeHandle nh;
   ros::NodeHandle pnh("~");
-  ros::ServiceClient generate_dataset_cli = nh.serviceClient<data_driven_mpc::GenerateDataset>("/generate_dataset");
   ros::ServiceClient run_sim_once_cli = nh.serviceClient<data_driven_mpc::RunSimOnce>("/run_sim_once");
-  ASSERT_TRUE(generate_dataset_cli.waitForExistence(ros::Duration(10.0)))
-      << "[TestMpcCart] Failed to wait for ROS service to generate dataset." << std::endl;
-  ASSERT_TRUE(run_sim_once_cli.waitForExistence(ros::Duration(10.0)))
-      << "[TestMpcCart] Failed to wait for ROS service to run simulation once." << std::endl;
+  // ASSERT_TRUE(run_sim_once_cli.waitForExistence(ros::Duration(10.0)))
+  //     << "[TestMpcCart] Failed to wait for ROS service to run simulation once." << std::endl;
 
   //// 1. Train state equation ////
   double horizon_dt = 0.1; // [sec]
@@ -188,28 +195,9 @@ TEST(TestMpcCart, Test1)
   // Instantiate problem
   auto ddp_problem = std::make_shared<DDPProblem>(horizon_dt, state_eq);
 
-  // Call service to generate dataset
-  auto start_dataset_time = std::chrono::system_clock::now();
-  data_driven_mpc::GenerateDataset generate_dataset_srv;
-  std::string dataset_filename = ros::package::getPath("data_driven_mpc") + "/tests/data/TestMpcCartDataset.bag";
-  int dataset_size = 10000;
-  DDPProblem::StateDimVector x_max = DDPProblem::StateDimVector(1.0, 0.2, 0.4, 0.5);
-  DDPProblem::InputDimVector u_max = DDPProblem::InputDimVector(15.0, 15.0);
-  generate_dataset_srv.request.filename = dataset_filename;
-  generate_dataset_srv.request.dataset_size = dataset_size;
-  generate_dataset_srv.request.dt = horizon_dt;
-  generate_dataset_srv.request.state_max.resize(state_dim);
-  DDPProblem::StateDimVector::Map(&generate_dataset_srv.request.state_max[0], state_dim) = x_max;
-  generate_dataset_srv.request.state_min.resize(state_dim);
-  DDPProblem::StateDimVector::Map(&generate_dataset_srv.request.state_min[0], state_dim) = -1 * x_max;
-  generate_dataset_srv.request.input_max.resize(input_dim);
-  DDPProblem::InputDimVector::Map(&generate_dataset_srv.request.input_max[0], input_dim) = u_max;
-  generate_dataset_srv.request.input_min.resize(input_dim);
-  DDPProblem::InputDimVector::Map(&generate_dataset_srv.request.input_min[0], input_dim) = -1 * u_max;
-  ASSERT_TRUE(generate_dataset_cli.call(generate_dataset_srv))
-      << "[TestMpcCart] Failed to call ROS service to generate dataset." << std::endl;
-
   // Load dataset from rosbag
+  auto start_dataset_time = std::chrono::system_clock::now();
+  std::string dataset_filename = ros::package::getPath("data_driven_mpc") + "/tests/data/HwmTestMpcCart.bag";
   Eigen::MatrixXd state_all;
   Eigen::MatrixXd input_all;
   Eigen::MatrixXd next_state_all;
@@ -219,6 +207,7 @@ TEST(TestMpcCart, Test1)
       rosbag::View(dataset_bag, rosbag::TopicQuery(std::vector<std::string>{"/dataset"})))
   {
     data_driven_mpc::Dataset::ConstPtr dataset_msg = msg.instantiate<data_driven_mpc::Dataset>();
+    int dataset_size = dataset_msg->dataset_size;
     state_all = Eigen::Map<const Eigen::MatrixXdRowMajor>(dataset_msg->state_all.data(), dataset_size, state_dim);
     input_all = Eigen::Map<const Eigen::MatrixXdRowMajor>(dataset_msg->input_all.data(), dataset_size, input_dim);
     next_state_all =
@@ -251,7 +240,7 @@ TEST(TestMpcCart, Test1)
   DDMPC::Training training;
   std::string model_path = ros::package::getPath("data_driven_mpc") + "/tests/data/TestMpcCartModel.pt";
   int batch_size = 256;
-  int num_epoch = 250;
+  int num_epoch = 1000;
   double learning_rate = 1e-3;
   training.run(state_eq, train_dataset, test_dataset, model_path, batch_size, num_epoch, learning_rate);
   training.load(state_eq, model_path);
@@ -270,12 +259,16 @@ TEST(TestMpcCart, Test1)
   double horizon_duration = 2.0; // [sec]
   int horizon_steps = static_cast<int>(horizon_duration / horizon_dt);
   double end_t = 3.0; // [sec]
+  DDPProblem::StateDimVector x_min = DDPProblem::StateDimVector(-1.0, -0.5, 0.0, -0.5);
+  DDPProblem::StateDimVector x_max = DDPProblem::StateDimVector(1.0, 0.5, 0.4, 0.5);
+  DDPProblem::InputDimVector u_min = DDPProblem::InputDimVector(-20.0, 10.0);
+  DDPProblem::InputDimVector u_max = DDPProblem::InputDimVector(20.0, 40.0);
 
   // Instantiate solver
   auto ddp_solver = std::make_shared<nmpc_ddp::DDPSolver<4, 2>>(ddp_problem);
   auto input_limits_func = [&](double t) -> std::array<DDPProblem::InputDimVector, 2> {
     std::array<DDPProblem::InputDimVector, 2> limits;
-    limits[0] = -1 * u_max;
+    limits[0] = u_min;
     limits[1] = u_max;
     return limits;
   };
@@ -287,8 +280,11 @@ TEST(TestMpcCart, Test1)
   // Initialize MPC
   double sim_dt = 0.05; // [sec]
   double current_t = 0;
-  DDPProblem::StateDimVector current_x = DDPProblem::StateDimVector(-0.2, 0.0, 0.2, 0.0);
+  DDPProblem::StateDimVector current_x = DDPProblem::StateDimVector(-0.5, 0.0, 0.1, 0.0);
   std::vector<DDPProblem::InputDimVector> current_u_list(horizon_steps, DDPProblem::InputDimVector::Zero());
+  DDPProblem::StateDimVector ref_x = DDPProblem::StateDimVector(0.0, 0.0, 0.2, 0.0);
+  DDPProblem::InputDimVector ref_u = DDPProblem::InputDimVector(0.0, 25.0);
+  ddp_problem->setRef(ref_x, ref_u);
 
   // Run MPC loop
   std::string file_path = "/tmp/TestMpcCartResult.txt";
@@ -314,11 +310,13 @@ TEST(TestMpcCart, Test1)
     // Check
     for(int i = 0; i < state_dim; i++)
     {
-      EXPECT_LT(std::abs(current_x[i]), 5 * x_max[i]) << "[TestMpcCart] Violate x[" << i << "] limits." << std::endl;
+      EXPECT_GT(current_x[i], 5 * x_min[i]) << "[TestMpcCart] Violate x[" << i << "] min limits." << std::endl;
+      EXPECT_LT(current_x[i], 5 * x_max[i]) << "[TestMpcCart] Violate x[" << i << "] max limits." << std::endl;
     }
     for(int i = 0; i < input_dim; i++)
     {
-      EXPECT_LE(std::abs(current_u[i]), u_max[i]) << "[TestMpcCart] Violate u[" << i << "] limits." << std::endl;
+      EXPECT_GE(current_u[i], u_min[i]) << "[TestMpcCart] Violate u[" << i << "] min limits." << std::endl;
+      EXPECT_LE(current_u[i], u_max[i]) << "[TestMpcCart] Violate u[" << i << "] max limits." << std::endl;
     }
 
     // Dump
@@ -341,12 +339,14 @@ TEST(TestMpcCart, Test1)
 
   // Final check
   const DDPProblem::InputDimVector & current_u = ddp_solver->controlData().u_list[0];
-  EXPECT_LT(std::abs(current_x[0]), 0.15);
-  EXPECT_LT(std::abs(current_x[1]), 0.5);
-  EXPECT_LT(std::abs(current_x[2]), 0.15);
-  EXPECT_LT(std::abs(current_x[3]), 0.5);
-  EXPECT_LT(std::abs(current_u[0]), 10.0);
-  EXPECT_LT(std::abs(current_u[1]), 15.0);
+  DDPProblem::StateDimVector error_x = current_x - ref_x;
+  DDPProblem::InputDimVector error_u = current_u - ref_u;
+  EXPECT_LT(std::abs(error_x[0]), 0.15);
+  EXPECT_LT(std::abs(error_x[1]), 0.5);
+  EXPECT_LT(std::abs(error_x[2]), 0.15);
+  EXPECT_LT(std::abs(error_x[3]), 0.5);
+  EXPECT_LT(std::abs(error_u[0]), 10.0);
+  EXPECT_LT(std::abs(error_u[1]), 15.0);
 
   std::cout << "Run the following commands in gnuplot:\n"
             << "  set key autotitle columnhead\n"
