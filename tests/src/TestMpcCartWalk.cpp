@@ -47,9 +47,9 @@ public:
 
     WeightParam()
     {
-      running_state << 0.0, 1e-4, 0.0, 1e-4, 1e3, 1e-4, 1e2, 1e-4;
+      running_state << 0.0, 1e-4, 0.0, 1e-4, 1e3, 1e-4, 1e3, 1e-4;
       running_input << 1e1, 1e1, 1e-1, 1e-1;
-      terminal_state << 1.0, 1.0, 1.0, 1.0, 1e2, 1.0, 1.0, 1.0;
+      terminal_state << 1.0, 1.0, 1.0, 1.0, 1e2, 1.0, 1.2, 1.0;
     }
   };
 
@@ -302,11 +302,8 @@ TEST(TestMpcCartWalk, RunMPC)
 {
   ros::NodeHandle nh;
   ros::NodeHandle pnh("~");
-  ros::ServiceClient generate_dataset_cli = nh.serviceClient<data_driven_mpc::GenerateDataset>("/generate_dataset");
-  ASSERT_TRUE(generate_dataset_cli.waitForExistence(ros::Duration(10.0)))
-      << "[TestMpcCartWalk] Failed to wait for ROS service to generate dataset." << std::endl;
-  ASSERT_TRUE(ros::service::waitForService("/run_sim_once", ros::Duration(10.0)))
-      << "[TestMpcCartWalk] Failed to wait for ROS service to run simulation once." << std::endl;
+  // ASSERT_TRUE(ros::service::waitForService("/run_sim_once", ros::Duration(10.0)))
+  //     << "[TestMpcCartWalk] Failed to wait for ROS service to run simulation once." << std::endl;
 
   //// 1. Train state equation ////
   double horizon_dt = 0.1; // [sec]
@@ -326,16 +323,19 @@ TEST(TestMpcCartWalk, RunMPC)
     ref_x.setZero();
     if(t < 1.0) // [sec]
     {
-      ref_x[4] = 0.5; // [m]
+      ref_x[4] = 0.0; // [m]
     }
     else if(t < 3.0) // [sec]
     {
-      ref_x[4] = 0.3 * (t - 1.0) + 0.5; // [m]
+      ref_x[4] = 0.3 * (t - 1.0); // [m]
     }
     else
     {
-      ref_x[4] = 1.1; // [m]
+      ref_x[4] = 0.6; // [m]
     }
+
+    // Object angle
+    ref_x[6] = 0.2; // [rad]
 
     // ZMP position
     ref_u.setZero();
@@ -356,34 +356,18 @@ TEST(TestMpcCartWalk, RunMPC)
       ref_u[0] = zmp_x_step * (static_cast<double>(step_idx) + ratio);
       ref_u[1] = (1.0 - ratio) * zmp_y_list[step_idx] + ratio * zmp_y_list[step_idx + 1];
     }
+    ref_u[0] -= 0.5; // [m]
     ref_x[0] = ref_u[0];
     ref_x[1] = ref_u[1];
+
+    // Manipulation force
+    ref_u[3] = 25.0; // [N]
   };
   auto ddp_problem = std::make_shared<DDPProblem>(horizon_dt, state_eq, ref_func);
 
-  // Call service to generate dataset
-  auto start_dataset_time = std::chrono::system_clock::now();
-  data_driven_mpc::GenerateDataset generate_dataset_srv;
-  std::string dataset_filename = ros::package::getPath("data_driven_mpc") + "/tests/data/TestMpcCartWalkDataset.bag";
-  int dataset_size = 10000;
-  DDPProblem::ObjStateDimVector x_max = DDPProblem::ObjStateDimVector(2.0, 0.2, 0.4, 0.5);
-  DDPProblem::ObjStateDimVector x_min = DDPProblem::ObjStateDimVector(0.0, -0.2, -0.4, -0.5);
-  DDPProblem::ObjInputDimVector u_max = DDPProblem::ObjInputDimVector(15.0, 15.0);
-  generate_dataset_srv.request.filename = dataset_filename;
-  generate_dataset_srv.request.dataset_size = dataset_size;
-  generate_dataset_srv.request.dt = horizon_dt;
-  generate_dataset_srv.request.state_max.resize(DDPProblem::ObjStateDim);
-  DDPProblem::ObjStateDimVector::Map(&generate_dataset_srv.request.state_max[0], DDPProblem::ObjStateDim) = x_max;
-  generate_dataset_srv.request.state_min.resize(DDPProblem::ObjStateDim);
-  DDPProblem::ObjStateDimVector::Map(&generate_dataset_srv.request.state_min[0], DDPProblem::ObjStateDim) = x_min;
-  generate_dataset_srv.request.input_max.resize(DDPProblem::ObjInputDim);
-  DDPProblem::ObjInputDimVector::Map(&generate_dataset_srv.request.input_max[0], DDPProblem::ObjInputDim) = u_max;
-  generate_dataset_srv.request.input_min.resize(DDPProblem::ObjInputDim);
-  DDPProblem::ObjInputDimVector::Map(&generate_dataset_srv.request.input_min[0], DDPProblem::ObjInputDim) = -1 * u_max;
-  ASSERT_TRUE(generate_dataset_cli.call(generate_dataset_srv))
-      << "[TestMpcCartWalk] Failed to call ROS service to generate dataset." << std::endl;
-
   // Load dataset from rosbag
+  auto start_dataset_time = std::chrono::system_clock::now();
+  std::string dataset_filename = ros::package::getPath("data_driven_mpc") + "/tests/data/HwmTestMpcCart.bag";
   Eigen::MatrixXd state_all;
   Eigen::MatrixXd input_all;
   Eigen::MatrixXd next_state_all;
@@ -393,6 +377,7 @@ TEST(TestMpcCartWalk, RunMPC)
       rosbag::View(dataset_bag, rosbag::TopicQuery(std::vector<std::string>{"/dataset"})))
   {
     data_driven_mpc::Dataset::ConstPtr dataset_msg = msg.instantiate<data_driven_mpc::Dataset>();
+    int dataset_size = dataset_msg->dataset_size;
     state_all =
         Eigen::Map<const Eigen::MatrixXdRowMajor>(dataset_msg->state_all.data(), dataset_size, DDPProblem::ObjStateDim);
     input_all =
@@ -428,7 +413,7 @@ TEST(TestMpcCartWalk, RunMPC)
   DDMPC::Training training;
   std::string model_path = ros::package::getPath("data_driven_mpc") + "/tests/data/TestMpcCartWalkModel.pt";
   int batch_size = 256;
-  int num_epoch = 400;
+  int num_epoch = 1000;
   double learning_rate = 1e-3;
   training.run(state_eq, train_dataset, test_dataset, model_path, batch_size, num_epoch, learning_rate);
   training.load(state_eq, model_path);
@@ -447,12 +432,14 @@ TEST(TestMpcCartWalk, RunMPC)
   double horizon_duration = 2.0; // [sec]
   int horizon_steps = static_cast<int>(horizon_duration / horizon_dt);
   double end_t = 5.0; // [sec]
+  DDPProblem::ObjInputDimVector u_min = DDPProblem::ObjInputDimVector(-20.0, 10.0);
+  DDPProblem::ObjInputDimVector u_max = DDPProblem::ObjInputDimVector(20.0, 40.0);
 
   // Instantiate solver
   auto ddp_solver = std::make_shared<nmpc_ddp::DDPSolver<8, 4>>(ddp_problem);
   auto input_limits_func = [&](double t) -> std::array<DDPProblem::InputDimVector, 2> {
     std::array<DDPProblem::InputDimVector, 2> limits;
-    limits[0] << Eigen::Vector2d::Constant(-1e10), -1 * u_max;
+    limits[0] << Eigen::Vector2d::Constant(-1e10), u_min;
     limits[1] << Eigen::Vector2d::Constant(1e10), u_max;
     return limits;
   };
@@ -465,7 +452,7 @@ TEST(TestMpcCartWalk, RunMPC)
   double sim_dt = 0.05; // [sec]
   double current_t = 0;
   DDPProblem::StateDimVector current_x;
-  current_x << 0.0, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.0;
+  current_x << -0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.1, 0.0;
   std::vector<DDPProblem::InputDimVector> current_u_list(horizon_steps, DDPProblem::InputDimVector::Zero());
 
   // Run MPC loop
@@ -507,8 +494,10 @@ TEST(TestMpcCartWalk, RunMPC)
       EXPECT_LT(std::abs(current_u[i] - current_ref_u[i]), 100.0)
           << "[TestMpcCartWalk] Violate running check for u[" << i << "]." << std::endl;
     }
-    EXPECT_LE(std::abs(current_u[2]), u_max[0]); // [N]
-    EXPECT_LE(std::abs(current_u[3]), u_max[1]); // [N]
+    EXPECT_GE(current_u[2], u_min[0]); // [N]
+    EXPECT_LE(current_u[2], u_max[0]); // [N]
+    EXPECT_GE(current_u[3], u_min[1]); // [N]
+    EXPECT_LE(current_u[3], u_max[1]); // [N]
 
     // Dump
     ofs << current_t << " " << current_x.transpose() << " " << current_u.transpose() << " " << current_ref_x.transpose()
